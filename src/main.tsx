@@ -19,6 +19,8 @@ interface AppContextType {
     setApiKey: (key: string) => void;
     geminiVersion: string;
     setGeminiVersion: (v: string) => void;
+    imageModelVersion: string;
+    setImageModelVersion: (v: string) => void;
     refinedPrompt: string;
     setRefinedPrompt: (prompt: string) => void;
     apiRequestsPerSecond: number;
@@ -32,6 +34,7 @@ interface AppContextType {
 const AppContext = createContext<AppContextType>({
     apiKey: '', setApiKey: () => { },
     geminiVersion: 'gemini-pro', setGeminiVersion: () => { },
+    imageModelVersion: '', setImageModelVersion: () => { },
     refinedPrompt: '', setRefinedPrompt: () => { },
     apiRequestsPerSecond: 0,
     domainQuestions: [], setDomainQuestions: () => { },
@@ -427,7 +430,7 @@ const DomainQueryWorkspace: WorkspaceComponentType = ({ setUsageStats, setApprov
         if (!refinedPrompt || questions || completed) return;
         setLoading(true);
         setError(null);
-        const prompt = `Given the topic: "${refinedPrompt}", generate a list of domain-related questions to ask the user to understand their context. Respond strictly in JSON format as an array of objects: string[].`;
+        const prompt = `Given the topic: "${refinedPrompt}", generate a list of domain-related questions to ask the user to understand their context. Respond strictly in JSON format as an array of strings.`;
         setUsageStats({ inputLength: prompt.length });
         setApprovalRequest({
             suggestedPrompt: prompt,
@@ -623,6 +626,222 @@ const ArticleLayoutWorkspace: WorkspaceComponentType = ({ setUsageStats, setAppr
     );
 };
 
+// VisualSuggestionWorkspace: new step for AI-driven visual suggestions for article sections
+const VisualSuggestionWorkspace: WorkspaceComponentType = ({ setUsageStats, setApprovalRequest, completed, onComplete, onRetry }) => {
+    const { apiKey, geminiVersion, articleLayout, imageModelVersion } = useContext(AppContext);
+    const { addToast } = useContext(ToastContext);
+    const [sectionPrompts, setSectionPrompts] = useState<string[]>([]);
+    const [visualSuggestions, setVisualSuggestions] = useState<string[]>([]);
+    const [approvedPrompts, setApprovedPrompts] = useState<string[]>([]);
+    const [images, setImages] = useState<string[]>([]);
+    const [loadingIdx, setLoadingIdx] = useState<number | null>(null);
+    const [error, setError] = useState('');
+
+    // Split articleLayout into sections (by headings)
+    useEffect(() => {
+        if (!articleLayout) return;
+        // Simple split by Markdown headings
+        const sections = articleLayout.split(/\n(?=#+ )/).filter(Boolean);
+        setSectionPrompts(sections.map((section) => `Suggest a contextually relevant visual for the following article section. Respond with a short image description and style suggestion.\nSection:\n${section}`));
+        setVisualSuggestions(Array(sections.length).fill(''));
+        setApprovedPrompts(Array(sections.length).fill(''));
+    }, [articleLayout]);
+
+    // Handler to request AI suggestion for a section
+    const handleSuggest = async (idx: number) => {
+        setLoadingIdx(idx);
+        setError('');
+        setUsageStats({ inputLength: sectionPrompts[idx].length });
+        setApprovalRequest({
+            suggestedPrompt: sectionPrompts[idx],
+            onApproval: async (approvedPrompt: string) => {
+                setApprovalRequest({
+                    suggestedPrompt: approvedPrompt,
+                    onApproval: () => { },
+                    processed: true,
+                    response: 'Awaiting response...',
+                });
+                try {
+                    addToast('Requesting visual suggestion...', 'info');
+                    const beginTime = performance.now();
+                    const response = await promptProcessor(apiKey, geminiVersion, approvedPrompt);
+                    const endTime = performance.now();
+                    const timeTaken = (endTime - beginTime) / 1000;
+                    setUsageStats({ inputLength: approvedPrompt.length, outputLength: response.length, timeTaken });
+                    setApprovalRequest({
+                        suggestedPrompt: approvedPrompt,
+                        onApproval: () => { },
+                        processed: true,
+                        response,
+                    });
+
+                    setVisualSuggestions(prev => prev.map((v, i) => i === idx ? response : v));
+                    setApprovedPrompts(prev => prev.map((p, i) => i === idx ? approvedPrompt : p));
+                    addToast('Visual suggestion generated!', 'success');
+
+                    // Request image from Gemini using the suggestion as prompt
+                    addToast('Generating image...', 'info');
+                    let imageUrl = '';
+                    try {
+                        if (!imageModelVersion) {
+                            throw new Error('No image model selected.');
+                        }
+                        imageUrl = await imageGeneration(apiKey, imageModelVersion, response);
+                        if (imageUrl) {
+                            addToast('Image generated successfully!', 'success');
+                        } else {
+                            throw new Error('Image generation returned no URL.');
+                        }
+                    } catch (imgErr: any) {
+                        if (imgErr?.message?.includes('unsupported') || imgErr?.message?.includes('not supported')) {
+                            setError('Image generation failed: Model does not support image generation.');
+                            addToast('Image generation failed: Model does not support image generation.', 'error');
+                        } else {
+                            setError('Image generation error: ' + (imgErr?.message || 'Unknown error'));
+                            addToast('Image generation error: ' + (imgErr?.message || 'Unknown error'), 'error');
+                        }
+                        imageUrl = 'https://placehold.co/400x200?text=Image+Error';
+                    }
+                    setImages(prev => {
+                        const newImages = [...prev];
+                        newImages[idx] = imageUrl;
+                        return newImages;
+                    });
+                } catch (err: any) {
+                    setError('Error: ' + (err?.message || 'Unknown error'));
+                    addToast('Error generating visual suggestion: ' + (err?.message || 'Unknown error'), 'error');
+                    setImages(prev => {
+                        const newImages = [...prev];
+                        newImages[idx] = 'https://placehold.co/400x200?text=Image+Error';
+                        return newImages;
+                    });
+                } finally {
+                    setLoadingIdx(null);
+                }
+            },
+            processed: false,
+            response: '',
+        });
+    };
+
+    // Handler to re-generate image for a section (after suggestion is generated)
+    const handleReGenerateImage = async (idx: number) => {
+        setLoadingIdx(idx);
+        setError('');
+        addToast('Re-generating image...', 'info');
+        try {
+            if (!imageModelVersion) {
+                throw new Error('No image model selected.');
+            }
+            const suggestion = visualSuggestions[idx];
+            if (!suggestion) {
+                throw new Error('No visual suggestion available for this section.');
+            }
+            const imageUrl = await imageGeneration(apiKey, imageModelVersion, suggestion);
+            if (imageUrl) {
+                addToast('Image re-generated successfully!', 'success');
+            } else {
+                throw new Error('Image generation returned no URL.');
+            }
+            setImages(prev => {
+                const newImages = [...prev];
+                newImages[idx] = imageUrl;
+                return newImages;
+            });
+        } catch (err: any) {
+            setError('Image re-generation error: ' + (err?.message || 'Unknown error'));
+            addToast('Image re-generation error: ' + (err?.message || 'Unknown error'), 'error');
+            setImages(prev => {
+                const newImages = [...prev];
+                newImages[idx] = 'https://placehold.co/400x200?text=Image+Error';
+                return newImages;
+            });
+        } finally {
+            setLoadingIdx(null);
+        }
+    };
+
+    // Handler to approve all and complete step
+    const handleCompleteAll = () => {
+        if (!completed) onComplete();
+    };
+
+    return (
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+            <Typography variant="h6">AI Visual Suggestions for Article Sections</Typography>
+            <Typography variant="body2" color="text.secondary">
+                This step demonstrates how AI can suggest contextually relevant visuals for each section of your article, enhancing efficiency, relevance, and engagement. For each section, you can request an AI-generated visual description and style suggestion, then approve or modify the prompt as needed.
+            </Typography>
+            {error && <Typography color="error">{error}</Typography>}
+            {sectionPrompts.length === 0 && <Typography variant="body2">No article sections found. Please complete the previous step.</Typography>}
+            {sectionPrompts.map((prompt, idx) => (
+                <Card key={idx} elevation={2} sx={{ mb: 2 }}>
+                    <CardContent>
+                        <Typography variant="subtitle2">Section {idx + 1}</Typography>
+                        <ReactMarkdown>{articleLayout.split(/\n(?=#+ )/)[idx] || ''}</ReactMarkdown>
+                        <Box sx={{ mt: 1 }}>
+                            <TextField
+                                value={approvedPrompts[idx] || prompt}
+                                onChange={e => setApprovedPrompts(prev => prev.map((p, i) => i === idx ? (e.target as HTMLInputElement).value : p))}
+                                label="Visual Prompt"
+                                variant="outlined"
+                                multiline
+                                minRows={2}
+                                maxRows={6}
+                                fullWidth
+                            />
+                        </Box>
+                        <Box sx={{ mt: 1, display: 'flex', gap: 1 }}>
+                            <Button
+                                variant="contained"
+                                onClick={() => handleSuggest(idx)}
+                                disabled={!!visualSuggestions[idx] || loadingIdx === idx}
+                            >{loadingIdx === idx ? 'Requesting...' : visualSuggestions[idx] ? 'Suggested' : 'Suggest Visual'}</Button>
+                            {visualSuggestions[idx] && (
+                                <Button
+                                    variant="outlined"
+                                    color="secondary"
+                                    onClick={() => handleReGenerateImage(idx)}
+                                    disabled={loadingIdx === idx}
+                                >{loadingIdx === idx ? 'Re-generating...' : 'Re-Generate Image'}</Button>
+                            )}
+                        </Box>
+                        {visualSuggestions[idx] && (
+                            <Box sx={{ mt: 2 }}>
+                                <Typography variant="subtitle2">AI Visual Suggestion</Typography>
+                                <Paper elevation={3} sx={{ p: 2, mb: 1, backgroundColor: '#f5f5f5' }}>
+                                    <ReactMarkdown>{visualSuggestions[idx]}</ReactMarkdown>
+                                    <Box sx={{ mt: 1, height: 120, backgroundColor: '#e0e0e0', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 2 }}>
+                                        {loadingIdx === idx ? (
+                                            <Typography variant="body2">Generating image...</Typography>
+                                        ) : images[idx] && images[idx] !== 'https://placehold.co/400x200?text=Image+Error' ? (
+                                            <img src={images[idx]} alt="AI generated visual" style={{ maxHeight: 120, maxWidth: '100%', borderRadius: 8 }} />
+                                        ) : images[idx] === 'https://placehold.co/400x200?text=Image+Error' ? (
+                                            <Typography variant="caption" color="error">Image generation failed</Typography>
+                                        ) : (
+                                            <Typography variant="caption" color="text.secondary">[AI-generated image would appear here]</Typography>
+                                        )}
+                                    </Box>
+                                </Paper>
+                            </Box>
+                        )}
+                    </CardContent>
+                </Card>
+            ))}
+            <SubmitRerunButtons
+                onSubmit={handleCompleteAll}
+                onRerun={onRetry}
+                submitDisabled={completed || sectionPrompts.length === 0 || visualSuggestions.some(v => !v)}
+                rerunVisible={completed}
+                rerunDisabled={false}
+                submitLabel="Approve All & Next"
+                rerunLabel="Rerun"
+            />
+        </Box>
+    );
+};
+
+
 // ArticleGenerationWorkspace: new step for article generation
 const ArticleGenerationWorkspace: WorkspaceComponentType = ({ setUsageStats, setApprovalRequest, completed, onComplete, onRetry }) => {
     const { apiKey, geminiVersion, articleLayout } = useContext(AppContext);
@@ -762,6 +981,78 @@ function ModelSelector() {
     );
 }
 
+// ImageModelSelector component
+function ImageModelSelector() {
+    const { addToast } = useContext(ToastContext);
+    const { imageModelVersion, setImageModelVersion, apiKey } = useContext(AppContext);
+    const [models, setModels] = useState<any[]>([]);
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+
+    useEffect(() => {
+        if (!apiKey) return;
+        setLoading(true);
+        setError(null);
+        fetchSupportedGeminiModels(apiKey)
+            .then(fetchedModels => {
+                // Filter for models that likely support image generation
+                const imageModels = fetchedModels.filter((model: any) => {
+                    // Heuristic: model name contains 'vision' or 'image' or 'multimodal'
+                    const name = model.name.toLowerCase();
+                    return name.includes('vision') || name.includes('image') || name.includes('multimodal');
+                });
+                setModels(imageModels);
+                setLoading(false);
+                if (imageModels.length > 0 && !imageModelVersion) {
+                    // Use 2.0 Flash Preview as default
+                    const defaultModel = imageModels.find((m: any) => m.name === 'models/gemini-2.0-flash-preview-image-generation');
+                    if (defaultModel) {
+                        setImageModelVersion(defaultModel.name);
+                        addToast(`Image model set to ${defaultModel.displayName || defaultModel.name}`, 'info');
+                    } else {
+                        addToast('Default image model not found, please select one.', 'warning');
+                    }
+                }
+            })
+            .catch(err => {
+                setError(err.message || 'Failed to fetch models');
+                setLoading(false);
+            });
+    }, [apiKey]);
+
+    function handleImageModelChange(value: string) {
+        setImageModelVersion(value);
+        const model = models.find(m => m.name === value);
+        addToast(`Image model set to ${model?.displayName || value}`, 'info');
+    }
+
+    return (
+        <Box>
+            <TextField
+                select
+                id="image-model-version"
+                value={imageModelVersion}
+                onChange={e => handleImageModelChange((e.target as HTMLInputElement).value)}
+                variant="outlined"
+                disabled={loading || !apiKey}
+                helperText={!apiKey ? 'Enter API key to load models' : error ? error : 'Select image model'}
+            >
+                {loading ? (
+                    <MenuItem value="" disabled>Loading models...</MenuItem>
+                ) : models.length > 0 ? (
+                    models.map(model => (
+                        <MenuItem key={model.name} value={model.name}>
+                            {model.displayName || ''} [{model.name}]
+                        </MenuItem>
+                    ))
+                ) : (
+                    <MenuItem value="" disabled>No image models found</MenuItem>
+                )}
+            </TextField>
+        </Box>
+    );
+}
+
 
 // useSteps hook
 function useSteps() {
@@ -781,6 +1072,10 @@ function useSteps() {
         {
             key: 'article-layout',
             WorkspaceComponent: ArticleLayoutWorkspace,
+        },
+        {
+            key: 'visual-suggestions',
+            WorkspaceComponent: VisualSuggestionWorkspace,
         },
         {
             key: 'article-generation',
@@ -861,9 +1156,12 @@ const theme = createTheme({
 function App() {
     const [apiKey, setApiKey] = useState('');
     const [geminiVersion, setGeminiVersion] = useState('');
+    const [imageModelVersion, setImageModelVersion] = useState('');
+
     // Toast state
     const [toasts, setToasts] = useState<Toast[]>([]);
     const toastId = useRef(0);
+
     const [refinedPrompt, setRefinedPrompt] = useState('');
     const [apiRequestsPerSecond, setApiRequestsPerSecond] = useState(0);
     const [domainQuestions, setDomainQuestions] = useState<Array<string>>([]);
@@ -896,6 +1194,7 @@ function App() {
                 <AppContext.Provider value={{
                     apiKey, setApiKey,
                     geminiVersion, setGeminiVersion,
+                    imageModelVersion, setImageModelVersion,
                     refinedPrompt, setRefinedPrompt,
                     apiRequestsPerSecond,
                     domainQuestions, setDomainQuestions,
@@ -915,6 +1214,7 @@ function App() {
                                 </Box>
                                 <Box sx={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 2 }}>
                                     <ModelSelector />
+                                    <ImageModelSelector />
                                     <Typography variant="body2" sx={{ ml: 2, fontWeight: 500 }}>
                                         API req/s: {apiRequestsPerSecond}
                                     </Typography>
@@ -978,5 +1278,51 @@ async function fetchSupportedGeminiModels(apiKey: string) {
         }
     });
 }
+
+// AI Image Generation Helper
+/**
+ * imageGeneration - Helper to request AI-generated images for a given prompt and style.
+ * @param apiKey Gemini API key
+ * @param version Gemini model version
+ * @param prompt Image description prompt
+ * @param style Optional style (e.g., 'realistic', 'illustrative', 'anime', 'abstract')
+ * @returns Promise<string> - URL or base64 string of generated image
+ */
+async function imageGeneration(apiKey: string, version: string, prompt: string, style?: string): Promise<string> {
+    if (!apiKey) throw new Error('API key is required');
+    if (!version) throw new Error('Gemini version is required');
+    if (!prompt) throw new Error('Prompt is required');
+    let fullPrompt = prompt;
+    if (style) {
+        fullPrompt += `\nStyle: ${style}`;
+    }
+    return apiRequestHandler(async () => {
+        const endpoint = `https://generativelanguage.googleapis.com/v1beta/${version}:generateContent`;
+        const res = await fetch(`${endpoint}?key=${encodeURIComponent(apiKey)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                contents: [{ parts: [{ text: fullPrompt }] }],
+                generationConfig: {
+                    candidateCount: 1,
+                    responseModalities: ['TEXT', 'IMAGE'], // IMAGE only may not be supported
+                },
+            }),
+        });
+        if (!res.ok) {
+            const errorText = await res.text();
+            throw new Error(`Gemini image API error: ${res.status} ${errorText}`);
+        }
+        const data = await res.json();
+        // Try to extract image URL or base64 from response
+        const imagePart = data?.candidates?.[0]?.content?.parts?.find((p: any) => p.inlineData || p.fileData || p.imageUrl);
+        if (imagePart?.imageUrl) return imagePart.imageUrl;
+        if (imagePart?.inlineData?.data) return `data:image/png;base64,${imagePart.inlineData.data}`;
+        if (imagePart?.fileData?.data) return `data:image/png;base64,${imagePart.fileData.data}`;
+        // Fallback: return text or placeholder
+        return data?.candidates?.[0]?.content?.parts?.[0]?.text || 'https://placehold.co/400x200?text=AI+Image';
+    });
+}
+
 
 render(<App />, document.getElementById('app')!);
